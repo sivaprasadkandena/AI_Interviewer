@@ -1,19 +1,38 @@
-
-
 import json
+import re
+import random
+from urllib.parse import urlencode
+
 from django.conf import settings
 from django.shortcuts import render, redirect
-from .forms import CandidateForm, AnswerForm
-from .models import Candidate, InterviewResponse
+from django.contrib import messages
+from django.views.decorators.cache import never_cache
+from django.core.mail import send_mail
+
+from authlib.integrations.django_client import OAuth
+
+from .forms import CandidateForm, AnswerForm, ProfileCompletionForm
+from .models import Candidate, InterviewResponse, RegisteredUser
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
+
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     google_api_key=settings.GOOGLE_API_KEY,
     temperature=0.7,
 )
+
+oauth = OAuth()
+oauth.register(
+    name='keycloak',
+    client_id=settings.AUTHLIB_OAUTH_CLIENTS['keycloak']['client_id'],
+    client_secret=settings.AUTHLIB_OAUTH_CLIENTS['keycloak']['client_secret'],
+    server_metadata_url=settings.AUTHLIB_OAUTH_CLIENTS['keycloak']['server_metadata_url'],
+    client_kwargs=settings.AUTHLIB_OAUTH_CLIENTS['keycloak']['client_kwargs'],
+)
+
 
 def generate_question(messages):
     langchain_messages = [SystemMessage(content="You are an AI interviewer.")]
@@ -23,46 +42,209 @@ def generate_question(messages):
     return response.content.strip()
 
 
-import re
-import json
-
 def evaluate_answer(question, answer):
     prompt = (
         f"Evaluate the following candidate answer to the interview question.\n\n"
         f"Question: {question}\n"
         f"Answer: {answer}\n\n"
-        f"Respond in JSON format like:\n"
-        f'{{"score": <0-5>, "qualified": "yes" or "no"}}\n'
+        f'Respond in JSON format like: {{"score": <0-5>, "qualified": "yes" or "no"}}\n'
         f"Only respond with valid JSON. No explanations."
     )
 
     result = llm.invoke([HumanMessage(content=prompt)])
     content = result.content.strip()
 
-    # Try JSON parse first
     try:
         parsed = json.loads(content)
-        score = int(parsed.get("score", 0))
-        qualified = parsed.get("qualified", "no")
-        return {"score": score, "qualified": qualified}
+        return {
+            "score": int(parsed.get("score", 0)),
+            "qualified": parsed.get("qualified", "no")
+        }
     except Exception:
-        # Try to extract JSON with regex
         try:
             match = re.search(r'{.*}', content)
             if match:
-                extracted_json = match.group()
-                parsed = json.loads(extracted_json)
-                score = int(parsed.get("score", 0))
-                qualified = parsed.get("qualified", "no")
-                return {"score": score, "qualified": qualified}
-        except:
+                parsed = json.loads(match.group())
+                return {
+                    "score": int(parsed.get("score", 0)),
+                    "qualified": parsed.get("qualified", "no")
+                }
+        except Exception:
             pass
 
-    # Default fallback if all parsing fails
     return {"score": 0, "qualified": "no"}
 
 
+# ---------------------------
+# SSO AUTH VIEWS
+# ---------------------------
+
+def index(request):
+    if 'user' in request.session:
+        return redirect('home')
+    return render(request, 'index.html')
+
+
+@never_cache
+def register_view(request):
+    messages.info(request, "Registration is handled through Keycloak.")
+    return redirect('user_login')
+
+
+@never_cache
+def user_login(request):
+    if 'user' in request.session:
+        return redirect('home')
+
+    redirect_uri = request.build_absolute_uri('/auth/callback/')
+    return oauth.keycloak.authorize_redirect(request, redirect_uri)
+
+
+@never_cache
+def callback_view(request):
+    token = oauth.keycloak.authorize_access_token(request)
+    userinfo = token.get('userinfo')
+
+    if not userinfo:
+        userinfo = oauth.keycloak.userinfo(token=token)
+
+    sub = userinfo.get('sub')
+    username = userinfo.get('preferred_username')
+    email = userinfo.get('email')
+    name = userinfo.get('name')
+
+    request.session['user'] = {
+        'sub': sub,
+        'username': username,
+        'email': email,
+        'name': name,
+    }
+    request.session['id_token'] = token.get('id_token')
+
+    profile, created = RegisteredUser.objects.get_or_create(
+        keycloak_sub=sub,
+        defaults={
+            'username': username,
+            'email': email,
+            'name': name,
+            'is_active': True,
+        }
+    )
+
+    changed = False
+    if not profile.username and username:
+        profile.username = username
+        changed = True
+    if not profile.email and email:
+        profile.email = email
+        changed = True
+    if not profile.name and name:
+        profile.name = name
+        changed = True
+    if changed:
+        profile.save()
+
+    if not profile.name or not profile.mobile or not profile.image:
+        return redirect('complete_profile')
+
+    messages.success(request, f"Welcome, {username}!")
+    return redirect('home')
+
+
+@never_cache
+def user_logout(request):
+    id_token = request.session.get('id_token')
+    request.session.pop('user', None)
+    request.session.pop('id_token', None)
+    request.session.flush()
+
+    redirect_uri = request.build_absolute_uri('/auth/login/')
+    params = {
+        "post_logout_redirect_uri": redirect_uri,
+        "id_token_hint": id_token,
+    }
+
+    logout_url = (
+        "http://localhost:8080/realms/sso-demo/protocol/openid-connect/logout?"
+        + urlencode(params)
+    )
+    return redirect(logout_url)
+
+
+@never_cache
+def home(request):
+    if 'user' not in request.session:
+        return redirect('user_login')
+
+    profile = RegisteredUser.objects.filter(
+        keycloak_sub=request.session['user'].get('sub')
+    ).first()
+
+    if not profile or not profile.name or not profile.mobile or not profile.image:
+        return redirect('complete_profile')
+
+    return render(request, 'home.html', {
+        'user': request.session.get('user'),
+        'profile': profile,
+    })
+
+
+@never_cache
+def complete_profile(request):
+    if 'user' not in request.session:
+        return redirect('user_login')
+
+    sso_user = request.session['user']
+    sub = sso_user.get('sub')
+
+    profile, created = RegisteredUser.objects.get_or_create(
+        keycloak_sub=sub,
+        defaults={
+            'username': sso_user.get('username'),
+            'email': sso_user.get('email'),
+            'name': sso_user.get('name'),
+            'is_active': True,
+        }
+    )
+
+    if request.method == 'POST':
+        form = ProfileCompletionForm(request.POST, request.FILES, instance=profile)
+        if form.is_valid():
+            form.save()
+            messages.success(request, "Profile completed successfully!")
+            return redirect('home')
+    else:
+        form = ProfileCompletionForm(instance=profile)
+
+    return render(request, 'users/complete_profile.html', {
+        'form': form,
+        'user': sso_user,
+    })
+
+
+@never_cache
+def user_homepage(request):
+    if 'user' not in request.session:
+        return redirect('user_login')
+
+    profile = RegisteredUser.objects.filter(
+        keycloak_sub=request.session['user'].get('sub')
+    ).first()
+
+    return render(request, 'users/user_homepage.html', {
+        'user': request.session.get('user'),
+        'profile': profile,
+    })
+
+
+# ---------------------------
+# KEEP INTERVIEW FEATURES
+# ---------------------------
+
 def start_interview(request):
+    if 'user' not in request.session:
+        return redirect('user_login')
+
     if request.method == 'POST':
         form = CandidateForm(request.POST)
 
@@ -74,12 +256,10 @@ def start_interview(request):
             )
 
             request.session['candidate_id'] = candidate.id
-
             job_desc = form.cleaned_data['job_description']
 
-            # UPDATED PROMPT
             request.session['messages'] = [{
-                "content":f"""
+                "content": f"""
                     You are an AI technical interviewer.
 
                     The candidate applied for a role with the following job description:
@@ -94,31 +274,30 @@ def start_interview(request):
                     - No examples
                     - No headings
                     - Only the question
-                    """
+                """
             }]
 
             request.session['question_count'] = 1
-
             first_question = generate_question(request.session['messages'])
-
-            request.session['messages'].append({
-                "content": first_question
-            })
+            request.session['messages'].append({"content": first_question})
 
             return render(request, 'users/question.html', {
                 'question': first_question,
                 'form': AnswerForm()
             })
-
     else:
         form = CandidateForm()
 
     return render(request, 'users/start.html', {'form': form})
 
+
 def answer_question(request):
+    if 'user' not in request.session:
+        return redirect('user_login')
+
     candidate_id = request.session.get('candidate_id')
     question_count = request.session.get('question_count', 1)
-    messages = request.session.get('messages', [])
+    messages_list = request.session.get('messages', [])
 
     candidate = Candidate.objects.get(id=candidate_id)
 
@@ -126,7 +305,7 @@ def answer_question(request):
         form = AnswerForm(request.POST)
         if form.is_valid():
             answer = form.cleaned_data['answer']
-            last_question = messages[-1]['content']
+            last_question = messages_list[-1]['content']
 
             evaluation = evaluate_answer(last_question, answer)
 
@@ -143,10 +322,8 @@ def answer_question(request):
             question_count += 1
             request.session['question_count'] = question_count
 
-            messages.append({"content": answer})
-
-            # 🔴 FIXED PROMPT
-            messages.append({
+            messages_list.append({"content": answer})
+            messages_list.append({
                 "content": (
                     "Ask ONE more very simple Python interview question.\n"
                     "Rules:\n"
@@ -157,9 +334,9 @@ def answer_question(request):
                 )
             })
 
-            next_question = generate_question(messages)
-            messages.append({"content": next_question})
-            request.session['messages'] = messages
+            next_question = generate_question(messages_list)
+            messages_list.append({"content": next_question})
+            request.session['messages'] = messages_list
 
             return render(request, 'users/question.html', {
                 'question': next_question,
@@ -167,20 +344,21 @@ def answer_question(request):
             })
 
     return render(request, 'users/question.html', {
-        'question': messages[-1]['content'],
+        'question': messages_list[-1]['content'],
         'form': AnswerForm()
     })
 
 
-from django.core.mail import send_mail
 def interview_results(request, candidate_id):
+    if 'user' not in request.session:
+        return redirect('user_login')
+
     candidate = Candidate.objects.get(id=candidate_id)
     responses = InterviewResponse.objects.filter(candidate=candidate)
     total_score = sum(r.score for r in responses if r.score is not None)
     avg_score = total_score / len(responses) if responses else 0
     status = "Qualified" if avg_score >= 3 else "Disqualified"
 
-    # Email subject and body based on status
     if status == "Qualified":
         subject = "🎉 Congratulations! You are Qualified"
         message = (
@@ -199,7 +377,6 @@ def interview_results(request, candidate_id):
             f"Best wishes,\nAI Interview Team"
         )
 
-    # Send email
     send_mail(
         subject,
         message,
@@ -214,7 +391,12 @@ def interview_results(request, candidate_id):
         'avg_score': avg_score,
         'qualification_status': status
     })
+
+
 def all_results(request):
+    if 'user' not in request.session:
+        return redirect('user_login')
+
     candidates = Candidate.objects.all().order_by('-id')
     results = []
     for c in candidates:
@@ -227,80 +409,13 @@ def all_results(request):
             'avg_score': avg_score,
             'status': status,
         })
+
     return render(request, 'users/all_results.html', {'results': results})
 
-###  code for home and logins
-def index(request):
-    return render(request, 'index.html')
 
-
-
-from django.shortcuts import render, redirect
-from .models import RegisteredUser
-from django.core.files.storage import FileSystemStorage
-
-def register_view(request):
-    msg = ''
-    if request.method == 'POST':
-        name = request.POST.get('name')
-        email = request.POST.get('email')
-        mobile = request.POST.get('mobile')
-        password = request.POST.get('password')
-        image = request.FILES.get('image')
-
-        # Basic validation
-        if not (name and email and mobile and password and image):
-            msg = "All fields are required."
-        else:
-            # Save image manually
-            fs = FileSystemStorage()
-            filename = fs.save(image.name, image)
-            img_url = fs.url(filename)
-
-            # Save user with is_active=False
-            RegisteredUser.objects.create(
-                name=name,
-                email=email,
-                mobile=mobile,
-                password=password,
-                image=filename,
-                is_active=False
-            )
-            msg = "Registered successfully! Wait for admin approval."
-
-    return render(request, 'register.html', {'msg': msg})
-
-from django.utils import timezone
-
-from django.utils import timezone
-import pytz
-
-def user_login(request):
-    msg = ''
-    if request.method == 'POST':
-        name = request.POST.get('name')
-        password = request.POST.get('password')
-
-        try:
-            user = RegisteredUser.objects.get(name=name, password=password)
-            if user.is_active:
-                # Convert current time to IST
-                ist = pytz.timezone('Asia/Kolkata')
-                local_time = timezone.now().astimezone(ist)
-
-                # Save user info in session
-                request.session['user_id'] = user.id
-                request.session['user_name'] = user.name
-                request.session['user_image'] = user.image.url  # image URL
-                request.session['login_time'] = local_time.strftime('%I:%M:%S %p')
-
-                return redirect('user_homepage')
-            else:
-                msg = "Your account is not activated yet."
-        except RegisteredUser.DoesNotExist:
-            msg = "Invalid credentials."
-
-    return render(request, 'user_login.html', {'msg': msg})
+# ---------------------------
+# OPTIONAL: KEEP ADMIN PAGES
+# ---------------------------
 
 def admin_login(request):
     msg = ''
@@ -315,12 +430,15 @@ def admin_login(request):
 
     return render(request, 'admin_login.html', {'msg': msg})
 
+
 def admin_home(request):
     return render(request, 'admin_home.html')
-    
+
+
 def admin_dashboard(request):
     users = RegisteredUser.objects.all()
     return render(request, 'admin_dashboard.html', {'users': users})
+
 
 def activate_user(request, user_id):
     user = RegisteredUser.objects.get(id=user_id)
@@ -328,99 +446,15 @@ def activate_user(request, user_id):
     user.save()
     return redirect('admin_dashboard')
 
+
 def deactivate_user(request, user_id):
     user = RegisteredUser.objects.get(id=user_id)
     user.is_active = False
     user.save()
     return redirect('admin_dashboard')
 
+
 def delete_user(request, user_id):
     user = RegisteredUser.objects.get(id=user_id)
     user.delete()
     return redirect('admin_dashboard')
-
-
-
-def home(request):
-    return render(request, 'home.html')
-
-def user_homepage(request):
-    if 'user_id' not in request.session:
-        # User not logged in, redirect to login page
-        return redirect('user_login')
-
-    user_name = request.session.get('user_name')
-    user_image = request.session.get('user_image')
-    login_time = request.session.get('login_time')
-
-    context = {
-        'user_name': user_name,
-        'user_image': user_image,
-        'login_time': login_time,
-    }
-    return render(request, 'users/user_homepage.html', context)
-
-def user_logout(request):
-    request.session.flush()  # Clears all session data
-    return redirect('user_login')
-
-
-
-import random
-from django.shortcuts import render, redirect
-from django.core.mail import send_mail
-from django.contrib import messages
-from .models import RegisteredUser
-
-otp_storage = {}  # Temporary dictionary to store OTPs
-
-def send_otp(email):
-    otp = random.randint(100000, 999999)  # Generate a 6-digit OTP
-    otp_storage[email] = otp
-
-    subject = "Password Reset OTP"
-    message = f"Your OTP for password reset is: {otp}"
-    from_email = "saikumardatapoint1@gmail.com"  # Change this to your email
-    send_mail(subject, message, from_email, [email])
-
-    return otp
-
-def forgot_password(request):
-    if request.method == "POST":
-        email = request.POST.get("email")
-
-        if RegisteredUser.objects.filter(email=email).exists():
-            send_otp(email)
-            request.session["reset_email"] = email  # Store email in session
-            return redirect("verify_otp")
-        else:
-            messages.error(request, "Email not registered!")
-
-    return render(request, "forgot_password.html")
-
-def verify_otp(request):
-    if request.method == "POST":
-        otp_entered = request.POST.get("otp")
-        email = request.session.get("reset_email")
-
-        if otp_storage.get(email) and str(otp_storage[email]) == otp_entered:
-            return redirect("reset_password")
-        else:
-            messages.error(request, "Invalid OTP!")
-
-    return render(request, "verify_otp.html")
-
-def reset_password(request):
-    if request.method == "POST":
-        new_password = request.POST.get("new_password")
-        email = request.session.get("reset_email")
-
-        if RegisteredUser.objects.filter(email=email).exists():
-            user = RegisteredUser.objects.get(email=email)
-            user.password = new_password  # Updating password
-            user.save()
-            messages.success(request, "Password reset successful! Please log in.")
-            return redirect("user_login")
-
-    return render(request, "reset_password.html")
-

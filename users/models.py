@@ -1,9 +1,8 @@
 from django.db import models
 
-# models.py
 class Candidate(models.Model):
     name = models.CharField(max_length=100)
-    email = models.EmailField()  # <-- Add this
+    email = models.EmailField()
     job_description = models.TextField()
 
     def __str__(self):
@@ -17,15 +16,16 @@ class InterviewResponse(models.Model):
     score = models.IntegerField(null=True, blank=True)
 
 
-from django.db import models
-
 class RegisteredUser(models.Model):
-    name = models.CharField(max_length=100)
-    email = models.EmailField()
-    mobile = models.CharField(max_length=15)
-    password = models.CharField(max_length=100)  # store plain for demo; use hashing in prod!
-    image = models.ImageField(upload_to='user_images/')
-    is_active = models.BooleanField(default=False)
+    keycloak_sub = models.CharField(max_length=255, unique=True, null=True, blank=True)
+    username = models.CharField(max_length=150, null=True, blank=True)
+    email = models.EmailField(blank=True, null=True)
+
+    # AI Interviewer specific fields
+    name = models.CharField(max_length=100, blank=True, null=True)
+    mobile = models.CharField(max_length=15, blank=True, null=True)
+    image = models.ImageField(upload_to='user_images/', blank=True, null=True)
+    is_active = models.BooleanField(default=True)
 
     def __str__(self):
-        return self.name
+        return self.username or self.name or "User"

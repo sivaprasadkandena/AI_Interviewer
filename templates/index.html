@@ -52,8 +52,8 @@
                 <div class="flex items-center space-x-4">
                     <a href="#features" class="text-gray-700 hover:text-blue-600">Features</a>
                     <a href="#how-it-works" class="text-gray-700 hover:text-blue-600">How It Works</a>
-                    <a href="#pricing" class="text-gray-700 hover:text-blue-600">Pricing</a>
-                    <a href="{% url 'home' %}" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">Get Started</a>
+                    <a href="{% url 'user_login' %}" class="bg-white text-blue-600 px-6 py-3 rounded-md hover:bg-gray-100">Try for Free</a>
+                    <a href="{% url 'user_login' %}" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">Get Started</a>
                 </div>
             </div>
         </div>
@@ -183,7 +183,7 @@
                         <li>Basic Analytics</li>
                         <li>Email Support</li>
                     </ul>
-                    <a href="#signup" class="block text-center bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">Choose Plan</a>
+                    <a href="{% url 'user_login' %}" class="bg-white text-blue-600 px-6 py-3 rounded-md hover:bg-gray-100">Get Started Now</a>
                 </div>
                 <div class="bg-gray-100 p-6 rounded-lg shadow-md hover:shadow-xl transition-shadow animate-slide-in">
                     <h3 class="text-xl font-semibold mb-2">Pro</h3>
