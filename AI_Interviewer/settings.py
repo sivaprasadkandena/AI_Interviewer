@@ -108,7 +108,7 @@ SESSION_SAVE_EVERY_REQUEST = True
 AUTHLIB_OAUTH_CLIENTS = {
     "keycloak": {
         "client_id": "app2-ai_interviewer-client",
-        "client_secret": os.environ.get('KEYCLOAK_CLIENT_SECRET', 'mg68Ddcx9ceWu0FJhFiJcOptQzTTibl7'),
+        "client_secret": os.environ.get('KEYCLOAK_CLIENT_SECRET', 'Y0QnCDwkSMi2gbHFUaElKca0TxpY9NZF'),
         "server_metadata_url": "http://localhost:8080/realms/sso-demo/.well-known/openid-configuration",
         "client_kwargs": {
             "scope": "openid profile email"
