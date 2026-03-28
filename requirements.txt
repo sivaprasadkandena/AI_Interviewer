@@ -8,4 +8,5 @@ langchain-google-genai==2.1.4
 langchain-core==0.3.60
 Pillow==10.4.0
 requests==2.32.3
-
+dj-database-url==2.3.0
+psycopg2-binary==2.9.10
