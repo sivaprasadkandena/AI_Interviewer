@@ -102,7 +102,7 @@ MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-GOOGLE_API_KEY = ''
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'
@@ -120,9 +120,9 @@ CSRF_COOKIE_NAME = 'ai_interviewer_csrftoken'
 
 AUTHLIB_OAUTH_CLIENTS = {
     "keycloak": {
-        "client_id": "",
-        "client_secret": "",
-        "server_metadata_url": "",
+        "client_id": os.environ.get("KEYCLOAK_CLIENT_ID"),
+        "client_secret": os.environ.get("KEYCLOAK_CLIENT_SECRET"),
+        "server_metadata_url": os.environ.get("KEYCLOAK_SERVER_METADATA_URL"),
         "client_kwargs": {
             "scope": "openid profile email"
         }
